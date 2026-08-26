@@ -4,13 +4,14 @@ import cors from 'cors';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+/* Alle B-værdi-kategorier */
 const CATEGORY_IDS = [
   18, 19, 20, 21, 22,
   23, 24, 25, 26, 27,
   30, 31, 46, 55, 62
 ];
 
-const API_BASE = 'https://freakyville.dk/api/heads/categories';
+const API_BASE = 'https://freakyville.dk/api';
 const CACHE_MS = 10 * 60 * 1000;
 
 app.use(cors({ origin: '*' }));
@@ -19,7 +20,8 @@ let cache = {
   items: [],
   updatedAt: null,
   error: null,
-  failedCategories: []
+  failedCategories: [],
+  priceGroupWarnings: []
 };
 
 function normalize(text = '') {
@@ -38,11 +40,8 @@ function toNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-function priceText(item) {
-  if (item.priceInfo) return item.priceInfo;
-
-  const min = toNumber(item.minDbValue);
-  const max = toNumber(item.maxDbValue);
+function makePriceText(min, max, priceInfo) {
+  if (priceInfo) return priceInfo;
 
   if (min !== null && max !== null) {
     return min === max ? `${min} DBs` : `${min}-${max} DBs`;
@@ -54,34 +53,11 @@ function priceText(item) {
   return 'Ikke prissat endnu';
 }
 
-function formatItem(item, categoryId) {
-  return {
-    id: item.id,
-    name: item.name,
-    keyword: normalize(item.name),
-    categoryId,
-    minDbValue: toNumber(item.minDbValue),
-    maxDbValue: toNumber(item.maxDbValue),
-    priceText: priceText(item),
-    priceInfo: item.priceInfo || null,
-    extraPriceInfo: item.extraPriceInfo || null,
-    extraInformation: item.extraInformation || null,
-    rarity: item.rarity || null,
-    tags: item.tags || null,
-    headId: item.headId || null,
-    headUrl: item.headUrl || null,
-    owner: item.owner || null,
-    ownerUpdated: item.ownerUpdated || null
-  };
-}
-
-async function fetchCategory(categoryId) {
-  const url = `${API_BASE}/${categoryId}/heads`;
-
+async function getJSON(url) {
   const response = await fetch(url, {
     headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; FreakyvilleTimerPriceBot/1.0)',
-      'Accept': 'application/json'
+      Accept: 'application/json',
+      'User-Agent': 'Mozilla/5.0 (compatible; FreakyvilleTimerPriceBot/1.0)'
     }
   });
 
@@ -92,18 +68,122 @@ async function fetchCategory(categoryId) {
   const data = await response.json();
 
   if (!data.success || !Array.isArray(data.items)) {
-    throw new Error('API svarede ikke med en gyldig itemliste');
+    throw new Error('Ugyldigt svar fra Freakyvilles API');
   }
 
-  return data.items.map(item => formatItem(item, categoryId));
+  return data.items;
+}
+
+function createPriceGroupMap(groups) {
+  const map = new Map();
+
+  for (const group of groups) {
+    map.set(Number(group.id), {
+      id: Number(group.id),
+      name: group.name || null,
+      minDbValue: toNumber(group.minDbValue),
+      maxDbValue: toNumber(group.maxDbValue),
+      priceInfo: group.priceInfo || null,
+      extraPriceInfo: group.extraPriceInfo || null
+    });
+  }
+
+  return map;
+}
+
+async function fetchCategory(categoryId) {
+  const heads = await getJSON(
+    `${API_BASE}/heads/categories/${categoryId}/heads`
+  );
+
+  let groupMap = new Map();
+  let priceGroupWarning = null;
+
+  try {
+    const groups = await getJSON(
+      `${API_BASE}/price-groups?categoryId=${categoryId}`
+    );
+
+    groupMap = createPriceGroupMap(groups);
+  } catch (error) {
+    priceGroupWarning = {
+      categoryId,
+      error: error.message
+    };
+  }
+
+  const items = heads.map(item => {
+    const directMin = toNumber(item.minDbValue);
+    const directMax = toNumber(item.maxDbValue);
+    const directPriceInfo = item.priceInfo || null;
+
+    const priceId =
+      item.price_id === null || item.price_id === undefined
+        ? null
+        : Number(item.price_id);
+
+    const group = priceId !== null ? groupMap.get(priceId) : null;
+
+    /*
+      Først bruger den headets egen værdi.
+      Hvis den ikke findes, bruger den værdien fra price_id/prisgruppen.
+    */
+    const minDbValue =
+      directMin !== null
+        ? directMin
+        : group?.minDbValue ?? null;
+
+    const maxDbValue =
+      directMax !== null
+        ? directMax
+        : group?.maxDbValue ?? null;
+
+    const priceInfo =
+      directPriceInfo ||
+      group?.priceInfo ||
+      null;
+
+    return {
+      id: item.id,
+      name: item.name,
+      keyword: normalize(item.name),
+      categoryId,
+
+      minDbValue,
+      maxDbValue,
+      priceText: makePriceText(minDbValue, maxDbValue, priceInfo),
+
+      priceInfo,
+      extraPriceInfo:
+        item.extraPriceInfo ||
+        group?.extraPriceInfo ||
+        null,
+
+      extraInformation: item.extraInformation || null,
+
+      priceId,
+      priceGroup: group?.name || null,
+
+      rarity: item.rarity || null,
+      tags: item.tags || null,
+      headId: item.headId || null,
+      headUrl: item.headUrl || null,
+      owner: item.owner || null,
+      ownerUpdated: item.ownerUpdated || null
+    };
+  });
+
+  return {
+    items,
+    priceGroupWarning
+  };
 }
 
 function mergeItems(items) {
   const unique = new Map();
 
   for (const item of items) {
-    const key = `${item.categoryId}-${item.id}`;
-    unique.set(key, item);
+    unique.set(`${item.categoryId}-${item.id}`, item);
   }
 
   return [...unique.values()].sort((a, b) =>
@@ -126,12 +206,17 @@ async function refreshPrices(force = false) {
 
   const allItems = [];
   const failedCategories = [];
+  const priceGroupWarnings = [];
 
   responses.forEach((result, index) => {
     const categoryId = CATEGORY_IDS[index];
 
     if (result.status === 'fulfilled') {
-      allItems.push(...result.value);
+      allItems.push(...result.value.items);
+
+      if (result.value.priceGroupWarning) {
+        priceGroupWarnings.push(result.value.priceGroupWarning);
+      }
     } else {
       failedCategories.push({
         categoryId,
@@ -146,7 +231,8 @@ async function refreshPrices(force = false) {
     cache = {
       ...cache,
       error: 'Kunne ikke opdatere priser. Viser senest gemte værdier.',
-      failedCategories
+      failedCategories,
+      priceGroupWarnings
     };
 
     return cache;
@@ -155,8 +241,11 @@ async function refreshPrices(force = false) {
   cache = {
     items,
     updatedAt: new Date().toISOString(),
-    error: items.length ? null : 'Fandt ingen B-værdi-items i Freakyvilles API.',
-    failedCategories
+    error: items.length
+      ? null
+      : 'Fandt ingen B-værdi-items i Freakyvilles API.',
+    failedCategories,
+    priceGroupWarnings
   };
 
   return cache;
@@ -175,6 +264,7 @@ app.get('/api/items', async (req, res) => {
     count: data.items.length,
     error: data.error,
     failedCategories: data.failedCategories,
+    priceGroupWarnings: data.priceGroupWarnings,
     items: data.items
   });
 });
@@ -189,7 +279,9 @@ app.get('/api/items/search', async (req, res) => {
   const results = !terms.length
     ? []
     : data.items
-        .filter(item => terms.every(term => item.keyword.includes(term)))
+        .filter(item =>
+          terms.every(term => item.keyword.includes(term))
+        )
         .sort((a, b) => {
           const aRank =
             a.keyword === query ? 0 :
@@ -209,6 +301,7 @@ app.get('/api/items/search', async (req, res) => {
     totalItems: data.items.length,
     error: data.error,
     failedCategories: data.failedCategories,
+    priceGroupWarnings: data.priceGroupWarnings,
     results
   });
 });
