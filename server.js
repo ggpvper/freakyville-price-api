@@ -1,77 +1,297 @@
-<!-- INDSÆT CSS I DIN EKSISTERENDE <style>-BLOK -->
-<style>
-.item-price-section{position:relative;z-index:5;margin-top:18px;padding:18px;border:2px solid #00cfff;border-radius:17px;background:linear-gradient(145deg,#061827,#030b15);box-shadow:0 0 25px #00cfff17}
-.item-price-title{margin:0 0 5px;font-size:20px;color:#eaf8ff}.item-price-description{margin:0 0 13px;color:#aebfd1;font-size:12px}.item-price-search-row{display:flex;gap:9px}.item-price-input{width:100%;height:42px;box-sizing:border-box;border:1px solid #00cfff;border-radius:10px;padding:0 12px;background:#071b30;color:#fff;font-size:14px;font-weight:700;outline:none}.item-price-input:focus{box-shadow:0 0 0 3px #00cfff26}.item-price-results{display:grid;gap:8px;margin-top:12px}.item-price-result{display:flex;justify-content:space-between;align-items:center;gap:12px;padding:11px 13px;border:1px solid #24415f;border-radius:10px;background:#04101c}.item-price-name{font-weight:900;color:#f4f8ff}.item-price-value{white-space:nowrap;color:#21ff42;font-weight:950;font-variant-numeric:tabular-nums}.item-price-meta{margin-top:10px;color:#8fa7bd;font-size:10px}.item-price-message{padding:11px 13px;border:1px solid #ffc40055;border-radius:10px;background:#ffc4000c;color:#f2d98c;font-size:12px}@media(max-width:520px){.item-price-search-row{display:block}.item-price-result{align-items:flex-start;flex-direction:column;gap:4px}}
-</style>
+import express from 'express';
+import cors from 'cors';
+import * as cheerio from 'cheerio';
 
-<!-- INDSÆT HTML'EN LIGE FØR </main> -->
-<section class="item-price-section" aria-labelledby="itemPriceTitle">
-  <h2 class="item-price-title" id="itemPriceTitle">◆ NPrison item-værdier</h2>
-  <p class="item-price-description">Søg efter heads og andre items. Priser vises i DBs og opdateres fra Freakyville via din pris-API.</p>
-  <div class="item-price-search-row">
-    <input id="itemPriceSearch" class="item-price-input" type="search" autocomplete="off" placeholder="Søg fx Plastic Steve Head" aria-label="Søg efter NPrison item">
-  </div>
-  <div id="itemPriceResults" class="item-price-results" aria-live="polite"></div>
-  <div id="itemPriceMeta" class="item-price-meta">Skriv mindst 2 bogstaver for at søge.</div>
-</section>
+const app = express();
+const PORT = process.env.PORT || 3000;
 
-<!-- INDSÆT SCRIPTET LIGE FØR </body>. RET API_URL TIL DIN EGEN SERVER -->
-<script>
-(() => {
-  'use strict';
-  const API_URL = 'https://DIN-API-DOMÆNE.DK/api/items/search';
-  const input = document.getElementById('itemPriceSearch');
-  const results = document.getElementById('itemPriceResults');
-  const meta = document.getElementById('itemPriceMeta');
-  let timer;
-  let controller;
+/* Kun B-værdi-kategorier fra Freakyville */
+const SOURCE_URLS = [
+  'https://freakyville.dk/priser/nprison/18',
+  'https://freakyville.dk/priser/nprison/19',
+  'https://freakyville.dk/priser/nprison/20',
+  'https://freakyville.dk/priser/nprison/21',
+  'https://freakyville.dk/priser/nprison/22',
+  'https://freakyville.dk/priser/nprison/23',
+  'https://freakyville.dk/priser/nprison/24',
+  'https://freakyville.dk/priser/nprison/25',
+  'https://freakyville.dk/priser/nprison/26',
+  'https://freakyville.dk/priser/nprison/27',
+  'https://freakyville.dk/priser/nprison/30',
+  'https://freakyville.dk/priser/nprison/31',
+  'https://freakyville.dk/priser/nprison/46',
+  'https://freakyville.dk/priser/nprison/55',
+  'https://freakyville.dk/priser/nprison/62'
+];
 
-  const formatDBs = value => new Intl.NumberFormat('da-DK', { maximumFractionDigits: 2 }).format(value) + ' DBs';
-  const formatTime = value => value ? new Intl.DateTimeFormat('da-DK', { dateStyle: 'short', timeStyle: 'short' }).format(new Date(value)) : 'ukendt';
-  const escapeHTML = text => String(text).replace(/[&<>'"]/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[char]));
+/* Opdater højst alle 10 minutter */
+const CACHE_MS = 10 * 60 * 1000;
 
-  function message(text) {
-    results.innerHTML = `<div class="item-price-message">${escapeHTML(text)}</div>`;
-  }
+app.use(cors({ origin: '*' }));
 
-  async function search(query) {
-    if (controller) controller.abort();
-    controller = new AbortController();
-    message('Søger efter priser…');
+let cache = {
+  items: [],
+  updatedAt: null,
+  error: null,
+  failedSources: []
+};
 
-    try {
-      const response = await fetch(API_URL + '?q=' + encodeURIComponent(query), { signal: controller.signal });
-      if (!response.ok) throw new Error('Kunne ikke hente priser lige nu.');
-      const data = await response.json();
+function normalize(text = '') {
+  return String(text)
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
 
-      if (data.error && !data.results?.length) throw new Error(data.error);
-      if (!data.results?.length) {
-        message('Intet item fundet. Prøv fx en kortere søgning eller en anden stavemåde.');
-      } else {
-        results.innerHTML = data.results.map(item => `
-          <article class="item-price-result">
-            <span class="item-price-name">${escapeHTML(item.name)}</span>
-            <span class="item-price-value">${formatDBs(item.price)}</span>
-          </article>
-        `).join('');
-      }
-      meta.textContent = `Senest opdateret: ${formatTime(data.updatedAt)} · Kilde: Freakyville NPrison-priser`;
-    } catch (error) {
-      if (error.name === 'AbortError') return;
-      message(error.message || 'Der opstod en fejl under søgningen.');
-      meta.textContent = 'Tjek at API_URL peger på din aktive pris-API.';
+function parsePrice(value = '') {
+  const cleaned = String(value)
+    .replace(/\./g, '')
+    .replace(/,/g, '.');
+
+  const match = cleaned.match(/\d+(?:\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+function isLikelyItemName(value = '') {
+  const text = String(value).trim();
+
+  return (
+    text.length >= 2 &&
+    text.length <= 120 &&
+    /[a-zæøå]/i.test(text) &&
+    !/^(pris|værdi|value|dbs?|item)$/i.test(text)
+  );
+}
+
+function itemFromText(text, source) {
+  const value = String(text).replace(/\s+/g, ' ').trim();
+
+  const priceMatch = value.match(
+    /(?:^|\s)([\d.,]+)\s*(?:dbs?|db)(?:\s|$)/i
+  );
+
+  if (!priceMatch) return null;
+
+  const price = parsePrice(priceMatch[1]);
+
+  const name = value
+    .replace(priceMatch[0], ' ')
+    .replace(/(?:pris|værdi|value)\s*:?/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (price === null || !isLikelyItemName(name)) return null;
+
+  return {
+    name,
+    price,
+    source
+  };
+}
+
+function extractItems(html, source) {
+  const $ = cheerio.load(html);
+  const found = [];
+
+  /* Finder items, hvis Freakyville bruger tabeller */
+  $('tr').each((_, row) => {
+    const cells = $(row)
+      .find('td, th')
+      .map((__, cell) =>
+        $(cell).text().replace(/\s+/g, ' ').trim()
+      )
+      .get();
+
+    if (cells.length < 2) return;
+
+    const priceCell = cells.find(cell =>
+      /\d[\d.,]*\s*(?:dbs?|db)\b/i.test(cell)
+    );
+
+    const nameCell = cells.find(
+      cell => cell !== priceCell && isLikelyItemName(cell)
+    );
+
+    const price = parsePrice(priceCell || '');
+
+    if (nameCell && price !== null) {
+      found.push({
+        name: nameCell,
+        price,
+        source
+      });
     }
-  }
-
-  input.addEventListener('input', () => {
-    const query = input.value.trim();
-    clearTimeout(timer);
-    if (query.length < 2) {
-      results.innerHTML = '';
-      meta.textContent = 'Skriv mindst 2 bogstaver for at søge.';
-      return;
-    }
-    timer = setTimeout(() => search(query), 300);
   });
-})();
-</script>
+
+  /*
+    Ekstra forsøg: Finder kort, lister og almindelige item-elementer.
+    Det gør den mere robust, hvis Freakyville ikke bruger tabeller.
+  */
+  $('[class*="item"], [class*="price"], li, article, .card, .row').each(
+    (_, element) => {
+      const item = itemFromText($(element).text(), source);
+
+      if (item) found.push(item);
+    }
+  );
+
+  return found;
+}
+
+function mergeItems(items) {
+  const unique = new Map();
+
+  for (const item of items) {
+    const key = normalize(item.name);
+
+    if (!key) continue;
+
+    /*
+      Hvis samme item står flere steder, beholder den seneste fundne pris.
+      Du kan senere ændre dette, hvis Freakyville bruger identiske navne
+      til forskellige items.
+    */
+    unique.set(key, {
+      ...item,
+      keyword: key
+    });
+  }
+
+  return [...unique.values()].sort((a, b) =>
+    a.name.localeCompare(b.name, 'da')
+  );
+}
+
+async function fetchOneSource(source) {
+  const response = await fetch(source, {
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (compatible; FreakyvilleTimerPriceBot/1.0)'
+    }
+  });
+
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  return extractItems(html, source);
+}
+
+async function refreshPrices(force = false) {
+  const isFresh =
+    cache.updatedAt &&
+    Date.now() - new Date(cache.updatedAt).getTime() < CACHE_MS;
+
+  if (!force && isFresh && cache.items.length) {
+    return cache;
+  }
+
+  const results = await Promise.allSettled(
+    SOURCE_URLS.map(source => fetchOneSource(source))
+  );
+
+  const allItems = [];
+  const failedSources = [];
+
+  results.forEach((result, index) => {
+    const source = SOURCE_URLS[index];
+
+    if (result.status === 'fulfilled') {
+      allItems.push(...result.value);
+    } else {
+      failedSources.push({
+        source,
+        error: result.reason?.message || 'Ukendt fejl'
+      });
+    }
+  });
+
+  const items = mergeItems(allItems);
+
+  /*
+    Behold sidste fungerende cache, hvis alle kilder fejler midlertidigt.
+  */
+  if (!items.length && cache.items.length) {
+    cache = {
+      ...cache,
+      error: 'Kunne ikke opdatere priser lige nu. Viser sidste gemte priser.',
+      failedSources
+    };
+
+    return cache;
+  }
+
+  cache = {
+    items,
+    updatedAt: new Date().toISOString(),
+    error: items.length
+      ? null
+      : 'Fandt ingen priser på B-værdi-siderne.',
+    failedSources
+  };
+
+  return cache;
+}
+
+app.get('/', (req, res) => {
+  res.send('Freakyville B-værdi pris-API kører.');
+});
+
+/* Se alle fundne items og fejl */
+app.get('/api/items', async (req, res) => {
+  const data = await refreshPrices(req.query.refresh === '1');
+
+  res.json({
+    sources: SOURCE_URLS,
+    updatedAt: data.updatedAt,
+    count: data.items.length,
+    error: data.error,
+    failedSources: data.failedSources,
+    items: data.items
+  });
+});
+
+/* Søg: /api/items/search?q=plastic+steve+head */
+app.get('/api/items/search', async (req, res) => {
+  const rawQuery = req.query.q || '';
+  const query = normalize(rawQuery);
+  const data = await refreshPrices(req.query.refresh === '1');
+  const terms = query.split(' ').filter(Boolean);
+
+  const matches = !terms.length
+    ? []
+    : data.items
+        .filter(item =>
+          terms.every(term => item.keyword.includes(term))
+        )
+        .sort((a, b) => {
+          const aRank =
+            a.keyword === query ? 0 : a.keyword.startsWith(query) ? 1 : 2;
+
+          const bRank =
+            b.keyword === query ? 0 : b.keyword.startsWith(query) ? 1 : 2;
+
+          return (
+            aRank - bRank ||
+            a.name.localeCompare(b.name, 'da')
+          );
+        })
+        .slice(0, 20);
+
+  res.json({
+    sources: SOURCE_URLS,
+    query: rawQuery,
+    updatedAt: data.updatedAt,
+    totalItems: data.items.length,
+    error: data.error,
+    failedSources: data.failedSources,
+    results: matches
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`Freakyville B-værdi pris-API kører på port ${PORT}`);
+});
