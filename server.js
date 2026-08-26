@@ -4,16 +4,14 @@ import cors from 'cors';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* Kun B-værdi-kategorier */
+/* Alle B-værdi-kategorier */
 const CATEGORY_IDS = [
   18, 19, 20, 21, 22,
   23, 24, 25, 26, 27,
   30, 31, 46, 55, 62
 ];
 
-const API_BASE = 'https://freakyville.dk/api/heads/categories';
-
-/* Opdaterer højst hvert 10. minut */
+const API_BASE = 'https://freakyville.dk/api';
 const CACHE_MS = 10 * 60 * 1000;
 
 app.use(cors({ origin: '*' }));
@@ -41,11 +39,8 @@ function toNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-function priceText(item) {
-  if (item.priceInfo) return item.priceInfo;
-
-  const min = toNumber(item.minDbValue);
-  const max = toNumber(item.maxDbValue);
+function priceTextFromValues(min, max, fallback = null) {
+  if (fallback) return fallback;
 
   if (min !== null && max !== null) {
     return min === max ? `${min} DBs` : `${min}-${max} DBs`;
@@ -57,21 +52,60 @@ function priceText(item) {
   return 'Ikke prissat endnu';
 }
 
-function formatItem(item, categoryId) {
-  const min = toNumber(item.minDbValue);
-  const max = toNumber(item.maxDbValue);
+function makeGroupMap(groups) {
+  const map = new Map();
+
+  for (const group of groups) {
+    map.set(Number(group.id), {
+      id: Number(group.id),
+      name: group.name || null,
+      minDbValue: toNumber(group.minDbValue),
+      maxDbValue: toNumber(group.maxDbValue),
+      priceInfo: group.priceInfo || null,
+      extraPriceInfo: group.extraPriceInfo || null
+    });
+  }
+
+  return map;
+}
+
+function formatItem(item, categoryId, groupMap) {
+  const ownMin = toNumber(item.minDbValue);
+  const ownMax = toNumber(item.maxDbValue);
+
+  const priceId =
+    item.price_id === null || item.price_id === undefined
+      ? null
+      : Number(item.price_id);
+
+  const group = priceId !== null ? groupMap.get(priceId) : null;
+
+  /*
+    Bruger først itemets direkte værdi.
+    Hvis den mangler, bruges værdien fra den tilknyttede prisgruppe.
+  */
+  const minDbValue = ownMin ?? group?.minDbValue ?? null;
+  const maxDbValue = ownMax ?? group?.maxDbValue ?? null;
+  const priceInfo = item.priceInfo || group?.priceInfo || null;
+  const extraPriceInfo = item.extraPriceInfo || group?.extraPriceInfo || null;
 
   return {
     id: item.id,
     name: item.name,
     keyword: normalize(item.name),
     categoryId,
-    minDbValue: min,
-    maxDbValue: max,
-    priceText: priceText(item),
-    priceInfo: item.priceInfo || null,
-    extraPriceInfo: item.extraPriceInfo || null,
+
+    minDbValue,
+    maxDbValue,
+    priceText: priceTextFromValues(minDbValue, maxDbValue, priceInfo),
+
+    priceInfo,
+    extraPriceInfo,
     extraInformation: item.extraInformation || null,
+
+    priceId,
+    priceGroup: group?.name || null,
+
     rarity: item.rarity || null,
     tags: item.tags || null,
     headId: item.headId || null,
@@ -81,9 +115,7 @@ function formatItem(item, categoryId) {
   };
 }
 
-async function fetchCategory(categoryId) {
-  const url = `${API_BASE}/${categoryId}/heads`;
-
+async function getJSON(url) {
   const response = await fetch(url, {
     headers: {
       'User-Agent': 'Mozilla/5.0 (compatible; FreakyvilleTimerPriceBot/1.0)',
@@ -98,22 +130,28 @@ async function fetchCategory(categoryId) {
   const data = await response.json();
 
   if (!data.success || !Array.isArray(data.items)) {
-    throw new Error('API svarede ikke med en gyldig itemliste');
+    throw new Error('Freakyvilles API svarede ikke med en gyldig itemliste');
   }
 
-  return data.items.map(item => formatItem(item, categoryId));
+  return data.items;
+}
+
+async function fetchCategory(categoryId) {
+  const [heads, priceGroups] = await Promise.all([
+    getJSON(`${API_BASE}/heads/categories/${categoryId}/heads`),
+    getJSON(`${API_BASE}/price-groups?categoryId=${categoryId}`)
+  ]);
+
+  const groupMap = makeGroupMap(priceGroups);
+
+  return heads.map(item => formatItem(item, categoryId, groupMap));
 }
 
 function mergeItems(items) {
   const unique = new Map();
 
   for (const item of items) {
-    /*
-      Beholder hvert item-id. Det betyder, at ens navne fra forskellige
-      kategorier ikke ved en fejl slettes.
-    */
-    const key = `${item.categoryId}-${item.id}`;
-    unique.set(key, item);
+    unique.set(`${item.categoryId}-${item.id}`, item);
   }
 
   return [...unique.values()].sort((a, b) =>
@@ -152,7 +190,7 @@ async function refreshPrices(force = false) {
 
   const items = mergeItems(allItems);
 
-  /* Beholder tidligere data, hvis Freakyvilles API kortvarigt fejler */
+  /* Behold gamle værdier, hvis Freakyvilles API midlertidigt ikke svarer */
   if (!items.length && cache.items.length) {
     cache = {
       ...cache,
@@ -166,7 +204,9 @@ async function refreshPrices(force = false) {
   cache = {
     items,
     updatedAt: new Date().toISOString(),
-    error: items.length ? null : 'Fandt ingen B-værdi-items i Freakyvilles API.',
+    error: items.length
+      ? null
+      : 'Fandt ingen B-værdi-items i Freakyvilles API.',
     failedCategories
   };
 
@@ -177,7 +217,6 @@ app.get('/', (req, res) => {
   res.send('Freakyville B-værdi pris-API kører.');
 });
 
-/* Tester hele API’en */
 app.get('/api/items', async (req, res) => {
   const data = await refreshPrices(req.query.refresh === '1');
 
@@ -191,7 +230,6 @@ app.get('/api/items', async (req, res) => {
   });
 });
 
-/* Søg eksempel: /api/items/search?q=frozone */
 app.get('/api/items/search', async (req, res) => {
   const rawQuery = String(req.query.q || '');
   const query = normalize(rawQuery);
@@ -202,7 +240,9 @@ app.get('/api/items/search', async (req, res) => {
   const results = !terms.length
     ? []
     : data.items
-        .filter(item => terms.every(term => item.keyword.includes(term)))
+        .filter(item =>
+          terms.every(term => item.keyword.includes(term))
+        )
         .sort((a, b) => {
           const aRank =
             a.keyword === query ? 0 :
