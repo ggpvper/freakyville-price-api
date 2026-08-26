@@ -4,17 +4,13 @@ import cors from 'cors';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/*
-  Alle B-værdi-kategorier fra Freakyville.
-  Hver kategori hentes fra:
-  https://freakyville.dk/api/heads/categories/KATEGORI/heads
-*/
 const CATEGORY_IDS = [
   18, 19, 20, 21, 22,
   23, 24, 25, 26, 27,
   30, 31, 46, 55, 62
 ];
 
+const API_BASE = 'https://freakyville.dk/api/heads/categories';
 const CACHE_MS = 10 * 60 * 1000;
 
 app.use(cors({ origin: '*' }));
@@ -36,18 +32,14 @@ function normalize(text = '') {
 }
 
 function toNumber(value) {
-  if (value === null || value === undefined || value === '') {
-    return null;
-  }
+  if (value === null || value === undefined || value === '') return null;
 
   const number = Number(String(value).replace(',', '.'));
   return Number.isFinite(number) ? number : null;
 }
 
-function makePriceText(item) {
-  if (item.priceInfo) {
-    return item.priceInfo;
-  }
+function priceText(item) {
+  if (item.priceInfo) return item.priceInfo;
 
   const min = toNumber(item.minDbValue);
   const max = toNumber(item.maxDbValue);
@@ -56,72 +48,62 @@ function makePriceText(item) {
     return min === max ? `${min} DBs` : `${min}-${max} DBs`;
   }
 
-  if (min !== null) {
-    return `${min}+ DBs`;
-  }
-
-  if (max !== null) {
-    return `Op til ${max} DBs`;
-  }
+  if (min !== null) return `${min}+ DBs`;
+  if (max !== null) return `Op til ${max} DBs`;
 
   return 'Ikke prissat endnu';
 }
 
+function formatItem(item, categoryId) {
+  return {
+    id: item.id,
+    name: item.name,
+    keyword: normalize(item.name),
+    categoryId,
+    minDbValue: toNumber(item.minDbValue),
+    maxDbValue: toNumber(item.maxDbValue),
+    priceText: priceText(item),
+    priceInfo: item.priceInfo || null,
+    extraPriceInfo: item.extraPriceInfo || null,
+    extraInformation: item.extraInformation || null,
+    rarity: item.rarity || null,
+    tags: item.tags || null,
+    headId: item.headId || null,
+    headUrl: item.headUrl || null,
+    owner: item.owner || null,
+    ownerUpdated: item.ownerUpdated || null
+  };
+}
+
 async function fetchCategory(categoryId) {
-  const url = `https://freakyville.dk/api/heads/categories/${categoryId}/heads`;
+  const url = `${API_BASE}/${categoryId}/heads`;
 
   const response = await fetch(url, {
     headers: {
-      'Accept': 'application/json',
-      'User-Agent': 'Mozilla/5.0'
+      'User-Agent': 'Mozilla/5.0 (compatible; FreakyvilleTimerPriceBot/1.0)',
+      'Accept': 'application/json'
     }
   });
 
   if (!response.ok) {
-    throw new Error(`Kategori ${categoryId}: HTTP ${response.status}`);
+    throw new Error(`HTTP ${response.status}`);
   }
 
   const data = await response.json();
 
   if (!data.success || !Array.isArray(data.items)) {
-    throw new Error(`Kategori ${categoryId}: ugyldigt API-svar`);
+    throw new Error('API svarede ikke med en gyldig itemliste');
   }
 
-  return data.items.map(item => ({
-    id: item.id,
-    name: item.name,
-    keyword: normalize(item.name),
-    categoryId,
-
-    minDbValue: toNumber(item.minDbValue),
-    maxDbValue: toNumber(item.maxDbValue),
-    priceText: makePriceText(item),
-
-    priceInfo: item.priceInfo || null,
-    extraPriceInfo: item.extraPriceInfo || null,
-    extraInformation: item.extraInformation || null,
-
-    priceId: item.price_id || null,
-    rarity: item.rarity || null,
-    tags: item.tags || null,
-
-    headId: item.headId || null,
-    headUrl: item.headUrl || null,
-
-    owner: item.owner || null,
-    ownerUpdated: item.ownerUpdated || null
-  }));
+  return data.items.map(item => formatItem(item, categoryId));
 }
 
-function combineItems(items) {
+function mergeItems(items) {
   const unique = new Map();
 
   for (const item of items) {
-    /*
-      Brug categoryId + item-id, så heads med samme navn
-      i forskellige kategorier ikke bliver fjernet.
-    */
-    unique.set(`${item.categoryId}-${item.id}`, item);
+    const key = `${item.categoryId}-${item.id}`;
+    unique.set(key, item);
   }
 
   return [...unique.values()].sort((a, b) =>
@@ -138,14 +120,14 @@ async function refreshPrices(force = false) {
     return cache;
   }
 
-  const requests = await Promise.allSettled(
+  const responses = await Promise.allSettled(
     CATEGORY_IDS.map(categoryId => fetchCategory(categoryId))
   );
 
   const allItems = [];
   const failedCategories = [];
 
-  requests.forEach((result, index) => {
+  responses.forEach((result, index) => {
     const categoryId = CATEGORY_IDS[index];
 
     if (result.status === 'fulfilled') {
@@ -158,16 +140,12 @@ async function refreshPrices(force = false) {
     }
   });
 
-  const items = combineItems(allItems);
+  const items = mergeItems(allItems);
 
-  /*
-    Hvis Freakyville kortvarigt ikke svarer, beholdes de seneste priser,
-    så søgningen ikke går helt tom.
-  */
   if (!items.length && cache.items.length) {
     cache = {
       ...cache,
-      error: 'Kunne ikke opdatere lige nu. Viser senest hentede priser.',
+      error: 'Kunne ikke opdatere priser. Viser senest gemte værdier.',
       failedCategories
     };
 
@@ -177,9 +155,7 @@ async function refreshPrices(force = false) {
   cache = {
     items,
     updatedAt: new Date().toISOString(),
-    error: items.length
-      ? null
-      : 'Fandt ingen items fra Freakyvilles B-værdi API.',
+    error: items.length ? null : 'Fandt ingen B-værdi-items i Freakyvilles API.',
     failedCategories
   };
 
@@ -187,10 +163,9 @@ async function refreshPrices(force = false) {
 }
 
 app.get('/', (req, res) => {
-  res.send('Freakyville B-værdi item-API kører.');
+  res.send('Freakyville B-værdi pris-API kører.');
 });
 
-/* Se alle hentede B-værdi-items */
 app.get('/api/items', async (req, res) => {
   const data = await refreshPrices(req.query.refresh === '1');
 
@@ -204,11 +179,6 @@ app.get('/api/items', async (req, res) => {
   });
 });
 
-/*
-  Søg eksempel:
-  /api/items/search?q=jellyfish
-  /api/items/search?q=pickle+rick
-*/
 app.get('/api/items/search', async (req, res) => {
   const rawQuery = String(req.query.q || '');
   const query = normalize(rawQuery);
@@ -219,9 +189,7 @@ app.get('/api/items/search', async (req, res) => {
   const results = !terms.length
     ? []
     : data.items
-        .filter(item =>
-          terms.every(term => item.keyword.includes(term))
-        )
+        .filter(item => terms.every(term => item.keyword.includes(term)))
         .sort((a, b) => {
           const aRank =
             a.keyword === query ? 0 :
@@ -246,5 +214,5 @@ app.get('/api/items/search', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Freakyville B-værdi API kører på port ${PORT}`);
+  console.log(`Freakyville B-værdi pris-API kører på port ${PORT}`);
 });
