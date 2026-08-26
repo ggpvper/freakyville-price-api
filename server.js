@@ -1,30 +1,19 @@
 import express from 'express';
 import cors from 'cors';
-import * as cheerio from 'cheerio';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* Kun B-værdi-kategorier fra Freakyville */
-const SOURCE_URLS = [
-  'https://freakyville.dk/priser/nprison/18',
-  'https://freakyville.dk/priser/nprison/19',
-  'https://freakyville.dk/priser/nprison/20',
-  'https://freakyville.dk/priser/nprison/21',
-  'https://freakyville.dk/priser/nprison/22',
-  'https://freakyville.dk/priser/nprison/23',
-  'https://freakyville.dk/priser/nprison/24',
-  'https://freakyville.dk/priser/nprison/25',
-  'https://freakyville.dk/priser/nprison/26',
-  'https://freakyville.dk/priser/nprison/27',
-  'https://freakyville.dk/priser/nprison/30',
-  'https://freakyville.dk/priser/nprison/31',
-  'https://freakyville.dk/priser/nprison/46',
-  'https://freakyville.dk/priser/nprison/55',
-  'https://freakyville.dk/priser/nprison/62'
+/* Kun B-værdi-kategorier */
+const CATEGORY_IDS = [
+  18, 19, 20, 21, 22,
+  23, 24, 25, 26, 27,
+  30, 31, 46, 55, 62
 ];
 
-/* Opdater højst alle 10 minutter */
+const API_BASE = 'https://freakyville.dk/api/heads/categories';
+
+/* Opdaterer højst hvert 10. minut */
 const CACHE_MS = 10 * 60 * 1000;
 
 app.use(cors({ origin: '*' }));
@@ -33,7 +22,7 @@ let cache = {
   items: [],
   updatedAt: null,
   error: null,
-  failedSources: []
+  failedCategories: []
 };
 
 function normalize(text = '') {
@@ -45,130 +34,60 @@ function normalize(text = '') {
     .trim();
 }
 
-function parsePrice(value = '') {
-  const cleaned = String(value)
-    .replace(/\./g, '')
-    .replace(/,/g, '.');
+function toNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
 
-  const match = cleaned.match(/\d+(?:\.\d+)?/);
-  return match ? Number(match[0]) : null;
+  const number = Number(String(value).replace(',', '.'));
+  return Number.isFinite(number) ? number : null;
 }
 
-function isLikelyItemName(value = '') {
-  const text = String(value).trim();
+function priceText(item) {
+  if (item.priceInfo) return item.priceInfo;
 
-  return (
-    text.length >= 2 &&
-    text.length <= 120 &&
-    /[a-zæøå]/i.test(text) &&
-    !/^(pris|værdi|value|dbs?|item)$/i.test(text)
-  );
+  const min = toNumber(item.minDbValue);
+  const max = toNumber(item.maxDbValue);
+
+  if (min !== null && max !== null) {
+    return min === max ? `${min} DBs` : `${min}-${max} DBs`;
+  }
+
+  if (min !== null) return `${min}+ DBs`;
+  if (max !== null) return `Op til ${max} DBs`;
+
+  return 'Ikke prissat endnu';
 }
 
-function itemFromText(text, source) {
-  const value = String(text).replace(/\s+/g, ' ').trim();
-
-  const priceMatch = value.match(
-    /(?:^|\s)([\d.,]+)\s*(?:dbs?|db)(?:\s|$)/i
-  );
-
-  if (!priceMatch) return null;
-
-  const price = parsePrice(priceMatch[1]);
-
-  const name = value
-    .replace(priceMatch[0], ' ')
-    .replace(/(?:pris|værdi|value)\s*:?/gi, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  if (price === null || !isLikelyItemName(name)) return null;
+function formatItem(item, categoryId) {
+  const min = toNumber(item.minDbValue);
+  const max = toNumber(item.maxDbValue);
 
   return {
-    name,
-    price,
-    source
+    id: item.id,
+    name: item.name,
+    keyword: normalize(item.name),
+    categoryId,
+    minDbValue: min,
+    maxDbValue: max,
+    priceText: priceText(item),
+    priceInfo: item.priceInfo || null,
+    extraPriceInfo: item.extraPriceInfo || null,
+    extraInformation: item.extraInformation || null,
+    rarity: item.rarity || null,
+    tags: item.tags || null,
+    headId: item.headId || null,
+    headUrl: item.headUrl || null,
+    owner: item.owner || null,
+    ownerUpdated: item.ownerUpdated || null
   };
 }
 
-function extractItems(html, source) {
-  const $ = cheerio.load(html);
-  const found = [];
+async function fetchCategory(categoryId) {
+  const url = `${API_BASE}/${categoryId}/heads`;
 
-  /* Finder items, hvis Freakyville bruger tabeller */
-  $('tr').each((_, row) => {
-    const cells = $(row)
-      .find('td, th')
-      .map((__, cell) =>
-        $(cell).text().replace(/\s+/g, ' ').trim()
-      )
-      .get();
-
-    if (cells.length < 2) return;
-
-    const priceCell = cells.find(cell =>
-      /\d[\d.,]*\s*(?:dbs?|db)\b/i.test(cell)
-    );
-
-    const nameCell = cells.find(
-      cell => cell !== priceCell && isLikelyItemName(cell)
-    );
-
-    const price = parsePrice(priceCell || '');
-
-    if (nameCell && price !== null) {
-      found.push({
-        name: nameCell,
-        price,
-        source
-      });
-    }
-  });
-
-  /*
-    Ekstra forsøg: Finder kort, lister og almindelige item-elementer.
-    Det gør den mere robust, hvis Freakyville ikke bruger tabeller.
-  */
-  $('[class*="item"], [class*="price"], li, article, .card, .row').each(
-    (_, element) => {
-      const item = itemFromText($(element).text(), source);
-
-      if (item) found.push(item);
-    }
-  );
-
-  return found;
-}
-
-function mergeItems(items) {
-  const unique = new Map();
-
-  for (const item of items) {
-    const key = normalize(item.name);
-
-    if (!key) continue;
-
-    /*
-      Hvis samme item står flere steder, beholder den seneste fundne pris.
-      Du kan senere ændre dette, hvis Freakyville bruger identiske navne
-      til forskellige items.
-    */
-    unique.set(key, {
-      ...item,
-      keyword: key
-    });
-  }
-
-  return [...unique.values()].sort((a, b) =>
-    a.name.localeCompare(b.name, 'da')
-  );
-}
-
-async function fetchOneSource(source) {
-  const response = await fetch(source, {
+  const response = await fetch(url, {
     headers: {
-      'User-Agent':
-        'Mozilla/5.0 (compatible; FreakyvilleTimerPriceBot/1.0)'
+      'User-Agent': 'Mozilla/5.0 (compatible; FreakyvilleTimerPriceBot/1.0)',
+      'Accept': 'application/json'
     }
   });
 
@@ -176,34 +95,56 @@ async function fetchOneSource(source) {
     throw new Error(`HTTP ${response.status}`);
   }
 
-  const html = await response.text();
-  return extractItems(html, source);
+  const data = await response.json();
+
+  if (!data.success || !Array.isArray(data.items)) {
+    throw new Error('API svarede ikke med en gyldig itemliste');
+  }
+
+  return data.items.map(item => formatItem(item, categoryId));
+}
+
+function mergeItems(items) {
+  const unique = new Map();
+
+  for (const item of items) {
+    /*
+      Beholder hvert item-id. Det betyder, at ens navne fra forskellige
+      kategorier ikke ved en fejl slettes.
+    */
+    const key = `${item.categoryId}-${item.id}`;
+    unique.set(key, item);
+  }
+
+  return [...unique.values()].sort((a, b) =>
+    a.name.localeCompare(b.name, 'da')
+  );
 }
 
 async function refreshPrices(force = false) {
-  const isFresh =
+  const cacheIsFresh =
     cache.updatedAt &&
     Date.now() - new Date(cache.updatedAt).getTime() < CACHE_MS;
 
-  if (!force && isFresh && cache.items.length) {
+  if (!force && cacheIsFresh && cache.items.length) {
     return cache;
   }
 
-  const results = await Promise.allSettled(
-    SOURCE_URLS.map(source => fetchOneSource(source))
+  const responses = await Promise.allSettled(
+    CATEGORY_IDS.map(categoryId => fetchCategory(categoryId))
   );
 
   const allItems = [];
-  const failedSources = [];
+  const failedCategories = [];
 
-  results.forEach((result, index) => {
-    const source = SOURCE_URLS[index];
+  responses.forEach((result, index) => {
+    const categoryId = CATEGORY_IDS[index];
 
     if (result.status === 'fulfilled') {
       allItems.push(...result.value);
     } else {
-      failedSources.push({
-        source,
+      failedCategories.push({
+        categoryId,
         error: result.reason?.message || 'Ukendt fejl'
       });
     }
@@ -211,14 +152,12 @@ async function refreshPrices(force = false) {
 
   const items = mergeItems(allItems);
 
-  /*
-    Behold sidste fungerende cache, hvis alle kilder fejler midlertidigt.
-  */
+  /* Beholder tidligere data, hvis Freakyvilles API kortvarigt fejler */
   if (!items.length && cache.items.length) {
     cache = {
       ...cache,
-      error: 'Kunne ikke opdatere priser lige nu. Viser sidste gemte priser.',
-      failedSources
+      error: 'Kunne ikke opdatere priser. Viser senest gemte værdier.',
+      failedCategories
     };
 
     return cache;
@@ -227,10 +166,8 @@ async function refreshPrices(force = false) {
   cache = {
     items,
     updatedAt: new Date().toISOString(),
-    error: items.length
-      ? null
-      : 'Fandt ingen priser på B-værdi-siderne.',
-    failedSources
+    error: items.length ? null : 'Fandt ingen B-værdi-items i Freakyvilles API.',
+    failedCategories
   };
 
   return cache;
@@ -240,55 +177,52 @@ app.get('/', (req, res) => {
   res.send('Freakyville B-værdi pris-API kører.');
 });
 
-/* Se alle fundne items og fejl */
+/* Tester hele API’en */
 app.get('/api/items', async (req, res) => {
   const data = await refreshPrices(req.query.refresh === '1');
 
   res.json({
-    sources: SOURCE_URLS,
+    categories: CATEGORY_IDS,
     updatedAt: data.updatedAt,
     count: data.items.length,
     error: data.error,
-    failedSources: data.failedSources,
+    failedCategories: data.failedCategories,
     items: data.items
   });
 });
 
-/* Søg: /api/items/search?q=plastic+steve+head */
+/* Søg eksempel: /api/items/search?q=frozone */
 app.get('/api/items/search', async (req, res) => {
-  const rawQuery = req.query.q || '';
+  const rawQuery = String(req.query.q || '');
   const query = normalize(rawQuery);
-  const data = await refreshPrices(req.query.refresh === '1');
   const terms = query.split(' ').filter(Boolean);
 
-  const matches = !terms.length
+  const data = await refreshPrices(req.query.refresh === '1');
+
+  const results = !terms.length
     ? []
     : data.items
-        .filter(item =>
-          terms.every(term => item.keyword.includes(term))
-        )
+        .filter(item => terms.every(term => item.keyword.includes(term)))
         .sort((a, b) => {
           const aRank =
-            a.keyword === query ? 0 : a.keyword.startsWith(query) ? 1 : 2;
+            a.keyword === query ? 0 :
+            a.keyword.startsWith(query) ? 1 : 2;
 
           const bRank =
-            b.keyword === query ? 0 : b.keyword.startsWith(query) ? 1 : 2;
+            b.keyword === query ? 0 :
+            b.keyword.startsWith(query) ? 1 : 2;
 
-          return (
-            aRank - bRank ||
-            a.name.localeCompare(b.name, 'da')
-          );
+          return aRank - bRank || a.name.localeCompare(b.name, 'da');
         })
-        .slice(0, 20);
+        .slice(0, 25);
 
   res.json({
-    sources: SOURCE_URLS,
     query: rawQuery,
     updatedAt: data.updatedAt,
     totalItems: data.items.length,
     error: data.error,
-    failedSources: data.failedSources,
-    results: matches
+    failedCategories: data.failedCategories,
+    results
   });
 });
 
