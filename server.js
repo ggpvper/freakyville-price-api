@@ -92,16 +92,22 @@ function createPriceGroupMap(groups) {
 }
 
 async function fetchCategory(categoryId) {
+  /* Henter itemnavne og eventuelle direkte værdier */
   const heads = await getJSON(
     `${API_BASE}/heads/categories/${categoryId}/heads`
   );
 
+  /*
+    Henter kategoriens prisgrupper.
+    Fx Pickle Rick i kategori 21 har price_id: 115,
+    som matcher id: 115 i dette API-kald.
+  */
   let groupMap = new Map();
   let priceGroupWarning = null;
 
   try {
     const groups = await getJSON(
-      `${API_BASE}/price-groups?categoryId=${categoryId}`
+      `${API_BASE}/heads/price-groups?categoryId=${categoryId}`
     );
 
     groupMap = createPriceGroupMap(groups);
@@ -125,8 +131,10 @@ async function fetchCategory(categoryId) {
     const group = priceId !== null ? groupMap.get(priceId) : null;
 
     /*
-      Først bruger den headets egen værdi.
-      Hvis den ikke findes, bruger den værdien fra price_id/prisgruppen.
+      Prioritet:
+      1) Headets egen pris
+      2) Prisgruppen via price_id
+      3) Ikke prissat endnu
     */
     const minDbValue =
       directMin !== null
