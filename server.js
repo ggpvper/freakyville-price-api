@@ -15,7 +15,15 @@ const API_BASE = 'https://freakyville.dk/api';
 const CACHE_MS = 10 * 60 * 1000;
 
 app.use(cors({ origin: '*' }));
+app.use(express.json());
 
+const TIMER_TOKEN = process.env.TIMER_TOKEN;
+
+let liveTimers = {
+  bplus_bo_robbed: null,
+  normal_bo_robbed: null,
+  updatedAt: null
+};
 let cache = {
   items: [],
   updatedAt: null,
@@ -313,7 +321,60 @@ app.get('/api/items/search', async (req, res) => {
     results
   });
 });
+app.post('/api/timers/event', (req, res) => {
+  const { token, event, timestamp, chatLine } = req.body || {};
 
+  if (!TIMER_TOKEN || token !== TIMER_TOKEN) {
+    return res.status(401).json({
+      success: false,
+      error: 'Forkert eller manglende timer-token'
+    });
+  }
+
+  const allowedEvents = [
+    'bplus_bo_robbed',
+    'normal_bo_robbed'
+  ];
+
+  if (!allowedEvents.includes(event)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Ukendt timer-event'
+    });
+  }
+
+  const time = Number(timestamp);
+
+  if (!Number.isFinite(time)) {
+    return res.status(400).json({
+      success: false,
+      error: 'Ugyldigt tidspunkt'
+    });
+  }
+
+  liveTimers[event] = {
+    timestamp: time,
+    chatLine: String(chatLine || ''),
+    receivedAt: new Date().toISOString()
+  };
+
+  liveTimers.updatedAt = new Date().toISOString();
+
+  console.log(`Timer-event modtaget: ${event}`);
+
+  res.json({
+    success: true,
+    event,
+    timers: liveTimers
+  });
+});
+
+app.get('/api/timers', (req, res) => {
+  res.json({
+    success: true,
+    timers: liveTimers
+  });
+});
 app.listen(PORT, () => {
   console.log(`Freakyville B-værdi pris-API kører på port ${PORT}`);
 });
