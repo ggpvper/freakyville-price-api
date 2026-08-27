@@ -14,24 +14,18 @@ const CATEGORY_IDS = [
 const API_BASE = 'https://freakyville.dk/api';
 const CACHE_MS = 10 * 60 * 1000;
 
-/*
-  VIGTIGT:
-  Opret TIMER_TOKEN i Render → Environment.
-  Skriv IKKE din rigtige hemmelige kode direkte i denne fil.
-*/
 const TIMER_TOKEN = process.env.TIMER_TOKEN;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '20kb' }));
 
-/* Gemmer seneste timer-events, modtaget fra dit lokale Python-program */
+/* Timer-delen er beholdt */
 let liveTimers = {
   bplus_bo_robbed: null,
   normal_bo_robbed: null,
   updatedAt: null
 };
 
-/* Gemmer itemdata i 10 minutter, så Freakyvilles API ikke spammes */
 let itemCache = {
   items: [],
   updatedAt: null,
@@ -51,21 +45,18 @@ function normalize(text = '') {
 
 function toNumber(value) {
   if (value === null || value === undefined || value === '') return null;
-
   const number = Number(String(value).replace(',', '.'));
   return Number.isFinite(number) ? number : null;
 }
 
 /*
-  Finder den faktiske enhed for en pris.
-
-  Prisgrupper fra Freakyville kan have "stacks", "DBs", "k", osv. i
-  priceInfo eller extraPriceInfo. Den gamle version ignorerede det og
-  tilføjede altid "DBs" til tal-priser. Derfor blev fx Frozone vist forkert.
+  Returnerer en enhed KUN hvis Freakyvilles rå data faktisk indeholder den.
+  Ingen standard-DBs og ingen gætning. Det forhindrer, at stacks bliver
+  vist som DBs og at DBs bliver vist som stacks.
 */
-function getPriceUnit(...texts) {
-  const text = texts
-    .filter(Boolean)
+function findExplicitUnit(...values) {
+  const text = values
+    .filter(value => value !== null && value !== undefined && value !== '')
     .map(value => String(value))
     .join(' ')
     .toLowerCase();
@@ -74,30 +65,40 @@ function getPriceUnit(...texts) {
   if (/\bdbs?\b|\bdiamond\s*blocks?\b|\bdiamant\s*blocks?\b/.test(text)) return 'DBs';
   if (/\bdiamonds?\b|\bdiamanter?\b/.test(text)) return 'diamonds';
   if (/\bmio\.?\b|\bmillion(er)?\b/.test(text)) return 'mio.';
-  if (/\bk\b|\btusind\b/.test(text)) return 'k';
+  if (/\btusind\b|\bk\b/.test(text)) return 'k';
 
   return null;
 }
 
 /*
-  Brug altid prisinfo-præcis som Freakyville sender den, når den findes.
-  Hvis API'en kun giver min/max-tal, bruger vi enhed fundet i priceInfo,
-  extraPriceInfo eller det rå item. DBs bruges kun som sidste fallback,
-  når der ingen enhed findes i kildedataen.
+  VIGTIGT OM ENHEDER
+
+  API'en må ikke selv opfinde "DBs" eller "stacks". Hvis Freakyville
+  sender en pris-tekst, viser vi den præcis som den står. Hvis den kun
+  sender tal, leder vi efter en enhed i ALLE item- og gruppefelter.
+
+  Hvis kilde-API'en ikke giver enhed nogen steder, vises kun tallet
+  uden en falsk enhed, fx "20-25 (enhed ukendt)". Det er ærligt og
+  forhindrer at prisdata bliver forkert.
 */
-function makePriceText(min, max, priceInfo, extraPriceInfo, rawUnitText) {
-  if (priceInfo) return String(priceInfo);
-
-  const unit = getPriceUnit(extraPriceInfo, rawUnitText) || 'DBs';
-
-  if (min !== null && max !== null) {
-    return min === max ? `${min} ${unit}` : `${min}-${max} ${unit}`;
+function makePriceText(min, max, priceInfo, unit) {
+  if (priceInfo && String(priceInfo).trim()) {
+    return String(priceInfo).trim();
   }
 
-  if (min !== null) return `${min}+ ${unit}`;
-  if (max !== null) return `Op til ${max} ${unit}`;
+  let amount = null;
+  if (min !== null && max !== null) {
+    amount = min === max ? String(min) : `${min}-${max}`;
+  } else if (min !== null) {
+    amount = `${min}+`;
+  } else if (max !== null) {
+    amount = `Op til ${max}`;
+  }
 
-  return 'Ikke prissat endnu';
+  if (!amount) return 'Ikke prissat endnu';
+
+  /* Brug kun enhed der faktisk fandtes i kilde-API'en. */
+  return unit ? `${amount} ${unit}` : `${amount} (enhed ukendt)`;
 }
 
 async function getJSON(url) {
@@ -108,9 +109,7 @@ async function getJSON(url) {
     }
   });
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
 
   const data = await response.json();
 
@@ -133,8 +132,10 @@ function createPriceGroupMap(groups) {
       priceInfo: group.priceInfo || null,
       extraPriceInfo: group.extraPriceInfo || null,
 
-      /* Gem eventuelle enheds-felter fra Freakyvilles API */
-      unit: group.unit || group.priceUnit || group.valueUnit || null,
+      /* Gem alle almindelige mulige enheds-felter fra Freakyville. */
+      unit: group.unit || null,
+      priceUnit: group.priceUnit || null,
+      valueUnit: group.valueUnit || null,
       raw: group
     });
   }
@@ -143,12 +144,10 @@ function createPriceGroupMap(groups) {
 }
 
 async function fetchCategory(categoryId) {
-  /* Henter alle heads i kategorien. */
   const heads = await getJSON(
     `${API_BASE}/heads/categories/${categoryId}/heads`
   );
 
-  /* Henter kategoriens prisgrupper. */
   let groupMap = new Map();
   let priceGroupWarning = null;
 
@@ -159,10 +158,7 @@ async function fetchCategory(categoryId) {
 
     groupMap = createPriceGroupMap(groups);
   } catch (error) {
-    priceGroupWarning = {
-      categoryId,
-      error: error.message
-    };
+    priceGroupWarning = { categoryId, error: error.message };
   }
 
   const items = heads.map(item => {
@@ -177,38 +173,32 @@ async function fetchCategory(categoryId) {
 
     const group = priceId !== null ? groupMap.get(priceId) : null;
 
-    /* Prisprioritet: direkte itemdata før prisgruppe. */
-    const minDbValue =
-      directMin !== null
-        ? directMin
-        : group?.minDbValue ?? null;
+    const minDbValue = directMin !== null ? directMin : group?.minDbValue ?? null;
+    const maxDbValue = directMax !== null ? directMax : group?.maxDbValue ?? null;
 
-    const maxDbValue =
-      directMax !== null
-        ? directMax
-        : group?.maxDbValue ?? null;
+    /* Hvis priceInfo findes, er det den originale fulde pris-tekst. */
+    const priceInfo = directPriceInfo || group?.priceInfo || null;
+    const extraPriceInfo = item.extraPriceInfo || group?.extraPriceInfo || null;
 
-    const priceInfo =
-      directPriceInfo ||
-      group?.priceInfo ||
-      null;
-
-    const extraPriceInfo =
-      item.extraPriceInfo ||
-      group?.extraPriceInfo ||
-      null;
-
-    /* Finder enheden fra alle felter, som den originale API kan sende. */
-    const priceUnit = getPriceUnit(
+    /*
+      Finder stacks/DBs osv. fra al rå data, men sætter aldrig selv DBs
+      som fallback. Det er det centrale fix.
+    */
+    const priceUnit = findExplicitUnit(
       item.unit,
       item.priceUnit,
       item.valueUnit,
-      group?.unit,
+      item.price_unit,
+      item.value_unit,
       item.extraPriceInfo,
-      group?.extraPriceInfo,
       item.priceInfo,
-      group?.priceInfo,
       item.price_group_name,
+      item.priceGroup,
+      group?.unit,
+      group?.priceUnit,
+      group?.valueUnit,
+      group?.extraPriceInfo,
+      group?.priceInfo,
       group?.name
     );
 
@@ -221,18 +211,11 @@ async function fetchCategory(categoryId) {
       minDbValue,
       maxDbValue,
       priceUnit,
-      priceText: makePriceText(
-        minDbValue,
-        maxDbValue,
-        priceInfo,
-        extraPriceInfo,
-        priceUnit
-      ),
+      priceText: makePriceText(minDbValue, maxDbValue, priceInfo, priceUnit),
 
       priceInfo,
       extraPriceInfo,
       extraInformation: item.extraInformation || null,
-
       priceId,
       priceGroup: group?.name || null,
       rarity: item.rarity || null,
@@ -244,22 +227,13 @@ async function fetchCategory(categoryId) {
     };
   });
 
-  return {
-    items,
-    priceGroupWarning
-  };
+  return { items, priceGroupWarning };
 }
 
 function mergeItems(items) {
   const unique = new Map();
-
-  for (const item of items) {
-    unique.set(`${item.categoryId}-${item.id}`, item);
-  }
-
-  return [...unique.values()].sort((a, b) =>
-    a.name.localeCompare(b.name, 'da')
-  );
+  for (const item of items) unique.set(`${item.categoryId}-${item.id}`, item);
+  return [...unique.values()].sort((a, b) => a.name.localeCompare(b.name, 'da'));
 }
 
 async function refreshPrices(force = false) {
@@ -267,9 +241,7 @@ async function refreshPrices(force = false) {
     itemCache.updatedAt &&
     Date.now() - new Date(itemCache.updatedAt).getTime() < CACHE_MS;
 
-  if (!force && cacheIsFresh && itemCache.items.length) {
-    return itemCache;
-  }
+  if (!force && cacheIsFresh && itemCache.items.length) return itemCache;
 
   const responses = await Promise.allSettled(
     CATEGORY_IDS.map(categoryId => fetchCategory(categoryId))
@@ -281,10 +253,8 @@ async function refreshPrices(force = false) {
 
   responses.forEach((result, index) => {
     const categoryId = CATEGORY_IDS[index];
-
     if (result.status === 'fulfilled') {
       allItems.push(...result.value.items);
-
       if (result.value.priceGroupWarning) {
         priceGroupWarnings.push(result.value.priceGroupWarning);
       }
@@ -305,16 +275,13 @@ async function refreshPrices(force = false) {
       failedCategories,
       priceGroupWarnings
     };
-
     return itemCache;
   }
 
   itemCache = {
     items,
     updatedAt: new Date().toISOString(),
-    error: items.length
-      ? null
-      : 'Fandt ingen B-værdi-items i Freakyvilles API.',
+    error: items.length ? null : 'Fandt ingen B-værdi-items i Freakyvilles API.',
     failedCategories,
     priceGroupWarnings
   };
@@ -322,15 +289,12 @@ async function refreshPrices(force = false) {
   return itemCache;
 }
 
-/* Forside: hurtig test af at Render-serveren er live */
 app.get('/', (req, res) => {
   res.send('Freakyville B-værdi item- og timer-API kører.');
 });
 
-/* Alle B-værdi-items */
 app.get('/api/items', async (req, res) => {
   const data = await refreshPrices(req.query.refresh === '1');
-
   res.json({
     categories: CATEGORY_IDS,
     updatedAt: data.updatedAt,
@@ -342,29 +306,19 @@ app.get('/api/items', async (req, res) => {
   });
 });
 
-/* Item-søgning */
 app.get('/api/items/search', async (req, res) => {
   const rawQuery = String(req.query.q || '');
   const query = normalize(rawQuery);
   const terms = query.split(' ').filter(Boolean);
-
   const data = await refreshPrices(req.query.refresh === '1');
 
   const results = !terms.length
     ? []
     : data.items
-        .filter(item =>
-          terms.every(term => item.keyword.includes(term))
-        )
+        .filter(item => terms.every(term => item.keyword.includes(term)))
         .sort((a, b) => {
-          const aRank =
-            a.keyword === query ? 0 :
-            a.keyword.startsWith(query) ? 1 : 2;
-
-          const bRank =
-            b.keyword === query ? 0 :
-            b.keyword.startsWith(query) ? 1 : 2;
-
+          const aRank = a.keyword === query ? 0 : a.keyword.startsWith(query) ? 1 : 2;
+          const bRank = b.keyword === query ? 0 : b.keyword.startsWith(query) ? 1 : 2;
           return aRank - bRank || a.name.localeCompare(b.name, 'da');
         })
         .slice(0, 25);
@@ -380,7 +334,7 @@ app.get('/api/items/search', async (req, res) => {
   });
 });
 
-/* Modtager timer-events fra det lokale Python-program. */
+/* ALT HERUNDER ER TIMER-KODEN OG ER IKKE ÆNDRET. */
 app.post('/api/timers/event', (req, res) => {
   const { token, event, timestamp, chatLine } = req.body || {};
 
@@ -429,7 +383,6 @@ app.post('/api/timers/event', (req, res) => {
   });
 });
 
-/* Timer-hjemmeside og overlay læser denne status. */
 app.get('/api/timers', (req, res) => {
   return res.json({
     success: true,
