@@ -56,15 +56,46 @@ function toNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
-function makePriceText(min, max, priceInfo) {
-  if (priceInfo) return priceInfo;
+/*
+  Finder den faktiske enhed for en pris.
+
+  Prisgrupper fra Freakyville kan have "stacks", "DBs", "k", osv. i
+  priceInfo eller extraPriceInfo. Den gamle version ignorerede det og
+  tilføjede altid "DBs" til tal-priser. Derfor blev fx Frozone vist forkert.
+*/
+function getPriceUnit(...texts) {
+  const text = texts
+    .filter(Boolean)
+    .map(value => String(value))
+    .join(' ')
+    .toLowerCase();
+
+  if (/\bstacks?\b|\bstk\.?\b/.test(text)) return 'stacks';
+  if (/\bdbs?\b|\bdiamond\s*blocks?\b|\bdiamant\s*blocks?\b/.test(text)) return 'DBs';
+  if (/\bdiamonds?\b|\bdiamanter?\b/.test(text)) return 'diamonds';
+  if (/\bmio\.?\b|\bmillion(er)?\b/.test(text)) return 'mio.';
+  if (/\bk\b|\btusind\b/.test(text)) return 'k';
+
+  return null;
+}
+
+/*
+  Brug altid prisinfo-præcis som Freakyville sender den, når den findes.
+  Hvis API'en kun giver min/max-tal, bruger vi enhed fundet i priceInfo,
+  extraPriceInfo eller det rå item. DBs bruges kun som sidste fallback,
+  når der ingen enhed findes i kildedataen.
+*/
+function makePriceText(min, max, priceInfo, extraPriceInfo, rawUnitText) {
+  if (priceInfo) return String(priceInfo);
+
+  const unit = getPriceUnit(extraPriceInfo, rawUnitText) || 'DBs';
 
   if (min !== null && max !== null) {
-    return min === max ? `${min} DBs` : `${min}-${max} DBs`;
+    return min === max ? `${min} ${unit}` : `${min}-${max} ${unit}`;
   }
 
-  if (min !== null) return `${min}+ DBs`;
-  if (max !== null) return `Op til ${max} DBs`;
+  if (min !== null) return `${min}+ ${unit}`;
+  if (max !== null) return `Op til ${max} ${unit}`;
 
   return 'Ikke prissat endnu';
 }
@@ -100,7 +131,11 @@ function createPriceGroupMap(groups) {
       minDbValue: toNumber(group.minDbValue),
       maxDbValue: toNumber(group.maxDbValue),
       priceInfo: group.priceInfo || null,
-      extraPriceInfo: group.extraPriceInfo || null
+      extraPriceInfo: group.extraPriceInfo || null,
+
+      /* Gem eventuelle enheds-felter fra Freakyvilles API */
+      unit: group.unit || group.priceUnit || group.valueUnit || null,
+      raw: group
     });
   }
 
@@ -108,19 +143,12 @@ function createPriceGroupMap(groups) {
 }
 
 async function fetchCategory(categoryId) {
-  /*
-    Henter alle heads i kategorien.
-    Dette endpoint giver fx Pickle Rick og dens price_id: 115.
-  */
+  /* Henter alle heads i kategorien. */
   const heads = await getJSON(
     `${API_BASE}/heads/categories/${categoryId}/heads`
   );
 
-  /*
-    Henter kategoriens prisgrupper.
-    Den KORREKTE sti er /api/heads/price-groups
-    og ikke /api/price-groups.
-  */
+  /* Henter kategoriens prisgrupper. */
   let groupMap = new Map();
   let priceGroupWarning = null;
 
@@ -131,10 +159,6 @@ async function fetchCategory(categoryId) {
 
     groupMap = createPriceGroupMap(groups);
   } catch (error) {
-    /*
-      Heads skal stadig vises, hvis Freakyvilles prisgruppe-kald
-      midlertidigt ikke virker.
-    */
     priceGroupWarning = {
       categoryId,
       error: error.message
@@ -153,12 +177,7 @@ async function fetchCategory(categoryId) {
 
     const group = priceId !== null ? groupMap.get(priceId) : null;
 
-    /*
-      Prisprioritet:
-      1. Direkte værdi på itemet.
-      2. Prisgruppe fundet via itemets price_id.
-      3. "Ikke prissat endnu".
-    */
+    /* Prisprioritet: direkte itemdata før prisgruppe. */
     const minDbValue =
       directMin !== null
         ? directMin
@@ -174,6 +193,25 @@ async function fetchCategory(categoryId) {
       group?.priceInfo ||
       null;
 
+    const extraPriceInfo =
+      item.extraPriceInfo ||
+      group?.extraPriceInfo ||
+      null;
+
+    /* Finder enheden fra alle felter, som den originale API kan sende. */
+    const priceUnit = getPriceUnit(
+      item.unit,
+      item.priceUnit,
+      item.valueUnit,
+      group?.unit,
+      item.extraPriceInfo,
+      group?.extraPriceInfo,
+      item.priceInfo,
+      group?.priceInfo,
+      item.price_group_name,
+      group?.name
+    );
+
     return {
       id: item.id,
       name: item.name,
@@ -182,19 +220,21 @@ async function fetchCategory(categoryId) {
 
       minDbValue,
       maxDbValue,
-      priceText: makePriceText(minDbValue, maxDbValue, priceInfo),
+      priceUnit,
+      priceText: makePriceText(
+        minDbValue,
+        maxDbValue,
+        priceInfo,
+        extraPriceInfo,
+        priceUnit
+      ),
 
       priceInfo,
-      extraPriceInfo:
-        item.extraPriceInfo ||
-        group?.extraPriceInfo ||
-        null,
-
+      extraPriceInfo,
       extraInformation: item.extraInformation || null,
 
       priceId,
       priceGroup: group?.name || null,
-
       rarity: item.rarity || null,
       tags: item.tags || null,
       headId: item.headId || null,
@@ -258,10 +298,6 @@ async function refreshPrices(force = false) {
 
   const items = mergeItems(allItems);
 
-  /*
-    Behold seneste gode item-cache, hvis Freakyvilles API
-    midlertidigt fejler for alle kategorier.
-  */
   if (!items.length && itemCache.items.length) {
     itemCache = {
       ...itemCache,
@@ -306,11 +342,7 @@ app.get('/api/items', async (req, res) => {
   });
 });
 
-/*
-  Item-søgning:
-  /api/items/search?q=pickle+rick
-  /api/items/search?q=jellyfish
-*/
+/* Item-søgning */
 app.get('/api/items/search', async (req, res) => {
   const rawQuery = String(req.query.q || '');
   const query = normalize(rawQuery);
@@ -348,11 +380,7 @@ app.get('/api/items/search', async (req, res) => {
   });
 });
 
-/*
-  Modtager timer-events fra Python-programmet på DIN computer.
-
-  Kun requests med samme TIMER_TOKEN som på Render accepteres.
-*/
+/* Modtager timer-events fra det lokale Python-program. */
 app.post('/api/timers/event', (req, res) => {
   const { token, event, timestamp, chatLine } = req.body || {};
 
@@ -401,7 +429,7 @@ app.post('/api/timers/event', (req, res) => {
   });
 });
 
-/* Din timer-hjemmeside læser denne status hvert 4. sekund */
+/* Timer-hjemmeside og overlay læser denne status. */
 app.get('/api/timers', (req, res) => {
   return res.json({
     success: true,
