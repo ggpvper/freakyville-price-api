@@ -14,17 +14,25 @@ const CATEGORY_IDS = [
 const API_BASE = 'https://freakyville.dk/api';
 const CACHE_MS = 10 * 60 * 1000;
 
-app.use(cors({ origin: '*' }));
-app.use(express.json());
-
+/*
+  VIGTIGT:
+  Opret TIMER_TOKEN i Render → Environment.
+  Skriv IKKE din rigtige hemmelige kode direkte i denne fil.
+*/
 const TIMER_TOKEN = process.env.TIMER_TOKEN;
 
+app.use(cors({ origin: '*' }));
+app.use(express.json({ limit: '20kb' }));
+
+/* Gemmer seneste timer-events, modtaget fra dit lokale Python-program */
 let liveTimers = {
   bplus_bo_robbed: null,
   normal_bo_robbed: null,
   updatedAt: null
 };
-let cache = {
+
+/* Gemmer itemdata i 10 minutter, så Freakyvilles API ikke spammes */
+let itemCache = {
   items: [],
   updatedAt: null,
   error: null,
@@ -100,15 +108,18 @@ function createPriceGroupMap(groups) {
 }
 
 async function fetchCategory(categoryId) {
-  /* Henter itemnavne og eventuelle direkte værdier */
+  /*
+    Henter alle heads i kategorien.
+    Dette endpoint giver fx Pickle Rick og dens price_id: 115.
+  */
   const heads = await getJSON(
     `${API_BASE}/heads/categories/${categoryId}/heads`
   );
 
   /*
     Henter kategoriens prisgrupper.
-    Fx Pickle Rick i kategori 21 har price_id: 115,
-    som matcher id: 115 i dette API-kald.
+    Den KORREKTE sti er /api/heads/price-groups
+    og ikke /api/price-groups.
   */
   let groupMap = new Map();
   let priceGroupWarning = null;
@@ -120,6 +131,10 @@ async function fetchCategory(categoryId) {
 
     groupMap = createPriceGroupMap(groups);
   } catch (error) {
+    /*
+      Heads skal stadig vises, hvis Freakyvilles prisgruppe-kald
+      midlertidigt ikke virker.
+    */
     priceGroupWarning = {
       categoryId,
       error: error.message
@@ -139,10 +154,10 @@ async function fetchCategory(categoryId) {
     const group = priceId !== null ? groupMap.get(priceId) : null;
 
     /*
-      Prioritet:
-      1) Headets egen pris
-      2) Prisgruppen via price_id
-      3) Ikke prissat endnu
+      Prisprioritet:
+      1. Direkte værdi på itemet.
+      2. Prisgruppe fundet via itemets price_id.
+      3. "Ikke prissat endnu".
     */
     const minDbValue =
       directMin !== null
@@ -209,11 +224,11 @@ function mergeItems(items) {
 
 async function refreshPrices(force = false) {
   const cacheIsFresh =
-    cache.updatedAt &&
-    Date.now() - new Date(cache.updatedAt).getTime() < CACHE_MS;
+    itemCache.updatedAt &&
+    Date.now() - new Date(itemCache.updatedAt).getTime() < CACHE_MS;
 
-  if (!force && cacheIsFresh && cache.items.length) {
-    return cache;
+  if (!force && cacheIsFresh && itemCache.items.length) {
+    return itemCache;
   }
 
   const responses = await Promise.allSettled(
@@ -243,18 +258,22 @@ async function refreshPrices(force = false) {
 
   const items = mergeItems(allItems);
 
-  if (!items.length && cache.items.length) {
-    cache = {
-      ...cache,
-      error: 'Kunne ikke opdatere priser. Viser senest gemte værdier.',
+  /*
+    Behold seneste gode item-cache, hvis Freakyvilles API
+    midlertidigt fejler for alle kategorier.
+  */
+  if (!items.length && itemCache.items.length) {
+    itemCache = {
+      ...itemCache,
+      error: 'Kunne ikke opdatere priser. Viser senest hentede priser.',
       failedCategories,
       priceGroupWarnings
     };
 
-    return cache;
+    return itemCache;
   }
 
-  cache = {
+  itemCache = {
     items,
     updatedAt: new Date().toISOString(),
     error: items.length
@@ -264,13 +283,15 @@ async function refreshPrices(force = false) {
     priceGroupWarnings
   };
 
-  return cache;
+  return itemCache;
 }
 
+/* Forside: hurtig test af at Render-serveren er live */
 app.get('/', (req, res) => {
-  res.send('Freakyville B-værdi pris-API kører.');
+  res.send('Freakyville B-værdi item- og timer-API kører.');
 });
 
+/* Alle B-værdi-items */
 app.get('/api/items', async (req, res) => {
   const data = await refreshPrices(req.query.refresh === '1');
 
@@ -285,6 +306,11 @@ app.get('/api/items', async (req, res) => {
   });
 });
 
+/*
+  Item-søgning:
+  /api/items/search?q=pickle+rick
+  /api/items/search?q=jellyfish
+*/
 app.get('/api/items/search', async (req, res) => {
   const rawQuery = String(req.query.q || '');
   const query = normalize(rawQuery);
@@ -321,6 +347,12 @@ app.get('/api/items/search', async (req, res) => {
     results
   });
 });
+
+/*
+  Modtager timer-events fra Python-programmet på DIN computer.
+
+  Kun requests med samme TIMER_TOKEN som på Render accepteres.
+*/
 app.post('/api/timers/event', (req, res) => {
   const { token, event, timestamp, chatLine } = req.body || {};
 
@@ -362,19 +394,21 @@ app.post('/api/timers/event', (req, res) => {
 
   console.log(`Timer-event modtaget: ${event}`);
 
-  res.json({
+  return res.json({
     success: true,
     event,
     timers: liveTimers
   });
 });
 
+/* Din timer-hjemmeside læser denne status hvert 4. sekund */
 app.get('/api/timers', (req, res) => {
-  res.json({
+  return res.json({
     success: true,
     timers: liveTimers
   });
 });
+
 app.listen(PORT, () => {
-  console.log(`Freakyville B-værdi pris-API kører på port ${PORT}`);
+  console.log(`Freakyville API kører på port ${PORT}`);
 });
