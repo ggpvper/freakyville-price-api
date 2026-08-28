@@ -1,5 +1,6 @@
 import express from 'express';
 import cors from 'cors';
+import { createClient } from '@supabase/supabase-js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -19,6 +20,24 @@ const CACHE_MS = 10 * 60 * 1000;
   Din lokale Python-fil skal bruge præcis samme token.
 */
 const TIMER_TOKEN = process.env.TIMER_TOKEN;
+
+/*
+  Supabase-variabler sættes kun i Render -> Environment.
+  Brug din sb_secret_... nøgle her. Den må ALDRIG ligge i HTML, Python
+  eller GitHub-kode.
+*/
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const supabase =
+  SUPABASE_URL && SUPABASE_SECRET_KEY
+    ? createClient(SUPABASE_URL, SUPABASE_SECRET_KEY, {
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false
+        }
+      })
+    : null;
 
 app.use(cors({ origin: '*' }));
 app.use(express.json({ limit: '20kb' }));
@@ -55,6 +74,25 @@ function toNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function isValidLicenseKey(value) {
+  return typeof value === 'string' && value.trim().length >= 6 && value.trim().length <= 200;
+}
+
+function isValidDeviceHash(value) {
+  return typeof value === 'string' && value.trim().length >= 16 && value.trim().length <= 256;
+}
+
+function requireSupabase(req, res, next) {
+  if (!supabase) {
+    return res.status(503).json({
+      success: false,
+      error: 'Licenssystemet er ikke konfigureret på serveren endnu'
+    });
+  }
+
+  next();
+}
+
 /*
   ITEM-PRIS-FIX
 
@@ -74,11 +112,6 @@ function makePriceText(min, max, priceInfo) {
     return priceInfo.trim();
   }
 
-  /*
-    Hvis den rå API ikke har priceInfo, vis kun tallet.
-    Vi sætter bevidst ikke DBs eller stacks på, da enheden ellers kan blive
-    forkert. Eksempel: "20-25 (enhed ikke oplyst af Freakyville)".
-  */
   if (min !== null && max !== null) {
     return min === max
       ? `${min} (enhed ikke oplyst)`
@@ -130,7 +163,6 @@ function createPriceGroupMap(groups) {
 }
 
 async function fetchCategory(categoryId) {
-  /* Henter hvert head med dets eget priceInfo-felt. */
   const heads = await getJSON(
     `${API_BASE}/heads/categories/${categoryId}/heads`
   );
@@ -145,7 +177,6 @@ async function fetchCategory(categoryId) {
 
     groupMap = createPriceGroupMap(groups);
   } catch (error) {
-    /* Heads vises stadig, hvis prisgruppe-endpointet er nede. */
     priceGroupWarning = {
       categoryId,
       error: error.message
@@ -173,12 +204,6 @@ async function fetchCategory(categoryId) {
         ? directMax
         : group?.maxDbValue ?? null;
 
-    /*
-      VIGTIG PRIORITET:
-      1. item.priceInfo: pris for det konkrete head, med rigtig enhed.
-      2. group.priceInfo: prisgruppe, også med rigtig enhed.
-      3. Tal uden opdigtet enhed.
-    */
     const priceInfo =
       item.priceInfo ||
       group?.priceInfo ||
@@ -189,19 +214,15 @@ async function fetchCategory(categoryId) {
       name: item.name,
       keyword: normalize(item.name),
       categoryId,
-
       minDbValue,
       maxDbValue,
       priceText: makePriceText(minDbValue, maxDbValue, priceInfo),
-
-      /* Behold rå data, så man kan fejlfinde priser senere. */
       priceInfo,
       extraPriceInfo:
         item.extraPriceInfo ||
         group?.extraPriceInfo ||
         null,
       extraInformation: item.extraInformation || null,
-
       priceId,
       priceGroup: group?.name || null,
       rarity: item.rarity || null,
@@ -264,7 +285,6 @@ async function refreshPrices(force = false) {
 
   const items = mergeItems(allItems);
 
-  /* Behold senest hentede priser, hvis Freakyville midlertidigt fejler. */
   if (!items.length && itemCache.items.length) {
     itemCache = {
       ...itemCache,
@@ -291,60 +311,237 @@ async function refreshPrices(force = false) {
 
 /* Forside: test at serveren er live */
 app.get('/', (req, res) => {
-  res.send('Freakyville B-værdi item- og timer-API kører.');
+  res.send('Freakyville B-værdi item-, timer- og licens-API kører.');
+});
+
+/* Enkel, sikker statuskontrol uden at afsløre nogen hemmelige værdier */
+app.get('/api/health', (req, res) => {
+  res.json({
+    success: true,
+    supabaseConfigured: Boolean(supabase),
+    timerTokenConfigured: Boolean(TIMER_TOKEN)
+  });
 });
 
 /* Alle B-værdi-items */
-app.get('/api/items', async (req, res) => {
-  const data = await refreshPrices(req.query.refresh === '1');
+app.get('/api/items', async (req, res, next) => {
+  try {
+    const data = await refreshPrices(req.query.refresh === '1');
 
-  res.json({
-    categories: CATEGORY_IDS,
-    updatedAt: data.updatedAt,
-    count: data.items.length,
-    error: data.error,
-    failedCategories: data.failedCategories,
-    priceGroupWarnings: data.priceGroupWarnings,
-    items: data.items
-  });
+    res.json({
+      categories: CATEGORY_IDS,
+      updatedAt: data.updatedAt,
+      count: data.items.length,
+      error: data.error,
+      failedCategories: data.failedCategories,
+      priceGroupWarnings: data.priceGroupWarnings,
+      items: data.items
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 /* Item-søgning til hjemmeside og overlay */
-app.get('/api/items/search', async (req, res) => {
-  const rawQuery = String(req.query.q || '');
-  const query = normalize(rawQuery);
-  const terms = query.split(' ').filter(Boolean);
+app.get('/api/items/search', async (req, res, next) => {
+  try {
+    const rawQuery = String(req.query.q || '');
+    const query = normalize(rawQuery);
+    const terms = query.split(' ').filter(Boolean);
 
-  const data = await refreshPrices(req.query.refresh === '1');
+    const data = await refreshPrices(req.query.refresh === '1');
 
-  const results = !terms.length
-    ? []
-    : data.items
-        .filter(item =>
-          terms.every(term => item.keyword.includes(term))
-        )
-        .sort((a, b) => {
-          const aRank =
-            a.keyword === query ? 0 :
-            a.keyword.startsWith(query) ? 1 : 2;
+    const results = !terms.length
+      ? []
+      : data.items
+          .filter(item =>
+            terms.every(term => item.keyword.includes(term))
+          )
+          .sort((a, b) => {
+            const aRank =
+              a.keyword === query ? 0 :
+              a.keyword.startsWith(query) ? 1 : 2;
 
-          const bRank =
-            b.keyword === query ? 0 :
-            b.keyword.startsWith(query) ? 1 : 2;
+            const bRank =
+              b.keyword === query ? 0 :
+              b.keyword.startsWith(query) ? 1 : 2;
 
-          return aRank - bRank || a.name.localeCompare(b.name, 'da');
-        })
-        .slice(0, 25);
+            return aRank - bRank || a.name.localeCompare(b.name, 'da');
+          })
+          .slice(0, 25);
 
-  res.json({
-    query: rawQuery,
-    updatedAt: data.updatedAt,
-    totalItems: data.items.length,
-    error: data.error,
-    failedCategories: data.failedCategories,
-    priceGroupWarnings: data.priceGroupWarnings,
-    results
-  });
+    res.json({
+      query: rawQuery,
+      updatedAt: data.updatedAt,
+      totalItems: data.items.length,
+      error: data.error,
+      failedCategories: data.failedCategories,
+      priceGroupWarnings: data.priceGroupWarnings,
+      results
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/*
+  LICENSER
+
+  POST /api/licenses/activate
+  Body:
+  {
+    "licenseKey": "FV-TEST-2026-ABCDE",
+    "deviceHash": "en-lang-tilfaeldig-hash-fra-klientprogrammet"
+  }
+
+  En ubrugt licens bindes første gang til deviceHash. Senere skal samme
+  deviceHash bruges. Hvis kunden får ny PC, nulstiller du device_hash i
+  Supabase Table Editor eller SQL Editor.
+*/
+app.post('/api/licenses/activate', requireSupabase, async (req, res, next) => {
+  try {
+    const licenseKey = String(req.body?.licenseKey || '').trim();
+    const deviceHash = String(req.body?.deviceHash || '').trim();
+
+    if (!isValidLicenseKey(licenseKey) || !isValidDeviceHash(deviceHash)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Ugyldig licenseKey eller deviceHash'
+      });
+    }
+
+    const { data: license, error: findError } = await supabase
+      .from('licenses')
+      .select('license_key, device_hash, active, created_at, activated_at')
+      .eq('license_key', licenseKey)
+      .maybeSingle();
+
+    if (findError) throw findError;
+
+    if (!license) {
+      return res.status(404).json({
+        success: false,
+        error: 'Licensnøglen findes ikke'
+      });
+    }
+
+    if (!license.active) {
+      return res.status(403).json({
+        success: false,
+        error: 'Denne licens er deaktiveret'
+      });
+    }
+
+    if (license.device_hash && license.device_hash !== deviceHash) {
+      return res.status(403).json({
+        success: false,
+        error: 'Licensen er allerede aktiveret på en anden computer'
+      });
+    }
+
+    const now = new Date().toISOString();
+    const updates = {
+      device_hash: deviceHash,
+      activated_at: license.activated_at || now,
+      last_seen_at: now
+    };
+
+    const { data: updatedLicense, error: updateError } = await supabase
+      .from('licenses')
+      .update(updates)
+      .eq('license_key', licenseKey)
+      .select('license_key, active, created_at, activated_at, last_seen_at')
+      .single();
+
+    if (updateError) throw updateError;
+
+    return res.json({
+      success: true,
+      message: 'Licensen er aktiv på denne computer',
+      license: updatedLicense
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/*
+  POST /api/licenses/validate
+  Body:
+  {
+    "licenseKey": "FV-TEST-2026-ABCDE",
+    "deviceHash": "samme-hash-som-ved-aktivering"
+  }
+*/
+app.post('/api/licenses/validate', requireSupabase, async (req, res, next) => {
+  try {
+    const licenseKey = String(req.body?.licenseKey || '').trim();
+    const deviceHash = String(req.body?.deviceHash || '').trim();
+
+    if (!isValidLicenseKey(licenseKey) || !isValidDeviceHash(deviceHash)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Ugyldig licenseKey eller deviceHash'
+      });
+    }
+
+    const { data: license, error: findError } = await supabase
+      .from('licenses')
+      .select('license_key, device_hash, active, created_at, activated_at')
+      .eq('license_key', licenseKey)
+      .maybeSingle();
+
+    if (findError) throw findError;
+
+    if (!license) {
+      return res.status(404).json({
+        success: false,
+        error: 'Licensnøglen findes ikke'
+      });
+    }
+
+    if (!license.active) {
+      return res.status(403).json({
+        success: false,
+        error: 'Denne licens er deaktiveret'
+      });
+    }
+
+    if (!license.device_hash) {
+      return res.status(403).json({
+        success: false,
+        error: 'Licensen er ikke aktiveret endnu'
+      });
+    }
+
+    if (license.device_hash !== deviceHash) {
+      return res.status(403).json({
+        success: false,
+        error: 'Licensen hører til en anden computer'
+      });
+    }
+
+    const now = new Date().toISOString();
+
+    const { error: updateError } = await supabase
+      .from('licenses')
+      .update({ last_seen_at: now })
+      .eq('license_key', licenseKey);
+
+    if (updateError) throw updateError;
+
+    return res.json({
+      success: true,
+      message: 'Licensen er gyldig',
+      license: {
+        licenseKey: license.license_key,
+        activatedAt: license.activated_at,
+        checkedAt: now
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 /*
@@ -407,6 +604,17 @@ app.get('/api/timers', (req, res) => {
   });
 });
 
+/* Centralt fejl-svar uden at lække serverens hemmeligheder */
+app.use((error, req, res, next) => {
+  console.error('Serverfejl:', error);
+
+  return res.status(500).json({
+    success: false,
+    error: 'Intern serverfejl'
+  });
+});
+
 app.listen(PORT, () => {
   console.log(`Freakyville API kører på port ${PORT}`);
+  console.log(`Supabase licenssystem: ${supabase ? 'konfigureret' : 'mangler environment variables'}`);
 });
